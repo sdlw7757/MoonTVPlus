@@ -1,6 +1,6 @@
 'use client';
 
-import { Calendar, Clock, ExternalLink, Film,Globe, Star, Tag, Users, X } from 'lucide-react';
+import { Calendar, Clock, ExternalLink, Film, Globe, Images, Star, Tag, Users, X } from 'lucide-react';
 import Image from 'next/image';
 import React, { useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
@@ -69,6 +69,16 @@ interface Episode {
   air_date: string;
 }
 
+interface GalleryImage {
+  file_path: string;
+  width: number;
+  height: number;
+  vote_average?: number;
+  vote_count?: number;
+  iso_639_1?: string | null;
+  imageType: 'backdrop' | 'poster';
+}
+
 const DetailPanel: React.FC<DetailPanelProps> = ({
   isOpen,
   onClose,
@@ -100,6 +110,15 @@ const DetailPanel: React.FC<DetailPanelProps> = ({
   const [seasonsLoaded, setSeasonsLoaded] = useState(false);
   const [showImageViewer, setShowImageViewer] = useState(false);
   const [selectedImage, setSelectedImage] = useState<string>('');
+  const [showGallery, setShowGallery] = useState(false);
+  const [galleryLoading, setGalleryLoading] = useState(false);
+  const [galleryError, setGalleryError] = useState<string | null>(null);
+  const [galleryImages, setGalleryImages] = useState<GalleryImage[]>([]);
+  const [galleryTotal, setGalleryTotal] = useState(0);
+  const [galleryScrollTop, setGalleryScrollTop] = useState(0);
+  const [galleryViewportHeight, setGalleryViewportHeight] = useState(0);
+  const [galleryViewportWidth, setGalleryViewportWidth] = useState(0);
+  const galleryScrollRef = React.useRef<HTMLDivElement>(null);
 
 
   // 数据源状态管理
@@ -151,10 +170,81 @@ const DetailPanel: React.FC<DetailPanelProps> = ({
     setShowImageViewer(true);
   };
 
+  const galleryTmdbId = detailData?.tmdbId || tmdbId;
+  const galleryMediaType = detailData?.mediaType || type;
+  const canShowGalleryEntry = !!galleryTmdbId && !!galleryMediaType;
+
+  const fetchGalleryImages = async () => {
+    if (!galleryTmdbId || !galleryMediaType) return;
+
+    setGalleryLoading(true);
+    setGalleryError(null);
+
+    try {
+      const response = await fetch(
+        `/api/tmdb/images?id=${galleryTmdbId}&type=${galleryMediaType}`
+      );
+
+      if (!response.ok) {
+        throw new Error('获取照片墙失败');
+      }
+
+      const data = await response.json();
+      setGalleryImages(data.list || []);
+      setGalleryTotal(data.total || 0);
+    } catch (err) {
+      console.error('获取照片墙失败:', err);
+      setGalleryError(err instanceof Error ? err.message : '获取照片墙失败');
+    } finally {
+      setGalleryLoading(false);
+    }
+  };
+
+  const openGallery = () => {
+    setShowGallery(true);
+  };
+
   // 确保组件在客户端挂载后才渲染 Portal
   useEffect(() => {
     setMounted(true);
   }, []);
+
+  useEffect(() => {
+    if (!showGallery) {
+      setGalleryImages([]);
+      setGalleryError(null);
+      setGalleryLoading(false);
+      setGalleryTotal(0);
+      setGalleryScrollTop(0);
+      setGalleryViewportHeight(0);
+      setGalleryViewportWidth(0);
+      return;
+    }
+
+    fetchGalleryImages();
+  }, [showGallery, galleryTmdbId, galleryMediaType]);
+
+  useEffect(() => {
+    if (!showGallery || !galleryScrollRef.current) return;
+
+    const element = galleryScrollRef.current;
+
+    const updateMetrics = () => {
+      setGalleryViewportHeight(element.clientHeight);
+      setGalleryViewportWidth(element.clientWidth);
+      setGalleryScrollTop(element.scrollTop);
+    };
+
+    updateMetrics();
+    element.addEventListener('scroll', updateMetrics, { passive: true });
+    const resizeObserver = new ResizeObserver(updateMetrics);
+    resizeObserver.observe(element);
+
+    return () => {
+      element.removeEventListener('scroll', updateMetrics);
+      resizeObserver.disconnect();
+    };
+  }, [showGallery]);
 
   // 控制动画状态
   useEffect(() => {
@@ -183,6 +273,12 @@ const DetailPanel: React.FC<DetailPanelProps> = ({
         clearTimeout(timer);
       }
     };
+  }, [isOpen]);
+
+  useEffect(() => {
+    if (!isOpen) {
+      setShowGallery(false);
+    }
   }, [isOpen]);
 
   // 阻止背景滚动（仅在非抽屉模式下）
@@ -887,6 +983,157 @@ const DetailPanel: React.FC<DetailPanelProps> = ({
     }
   };
 
+  const galleryEntryButton = canShowGalleryEntry ? (
+    <button
+      onClick={openGallery}
+      className="inline-flex items-center gap-2 px-3 py-1.5 text-sm rounded-lg bg-blue-500 hover:bg-blue-600 text-white transition-colors"
+    >
+      <Images size={16} />
+      照片墙
+    </button>
+  ) : null;
+
+  const virtualGalleryLayout = React.useMemo(() => {
+    if (galleryImages.length === 0 || galleryViewportWidth <= 0) {
+      return {
+        visibleItems: [] as Array<GalleryImage & { top: number; left: number; renderWidth: number; renderHeight: number; index: number }>,
+        totalHeight: 0,
+        usedWidth: 0,
+      };
+    }
+
+    const gap = 4;
+    const overscan = 800;
+    const horizontalPadding = 32;
+    const width = Math.max(galleryViewportWidth - horizontalPadding, 0);
+    const columnCount = width >= 1280 ? 5 : width >= 1024 ? 4 : width >= 640 ? 3 : 2;
+    const columnWidth = Math.floor((width - gap * (columnCount - 1)) / columnCount);
+    const usedWidth = columnWidth * columnCount + gap * (columnCount - 1);
+    const columnHeights = new Array(columnCount).fill(0);
+
+    const items = galleryImages.map((image, index) => {
+      let targetColumn = 0;
+      for (let i = 1; i < columnCount; i++) {
+        if (columnHeights[i] < columnHeights[targetColumn]) {
+          targetColumn = i;
+        }
+      }
+
+      const ratio = image.width && image.height ? image.height / image.width : (image.imageType === 'poster' ? 1.5 : 0.5625);
+      const renderHeight = Math.max(Math.round(columnWidth * ratio), 80);
+      const top = columnHeights[targetColumn];
+      const left = targetColumn * (columnWidth + gap);
+
+      columnHeights[targetColumn] += renderHeight + gap;
+
+      return {
+        ...image,
+        index,
+        top,
+        left,
+        renderWidth: columnWidth,
+        renderHeight,
+      };
+    });
+
+    const totalHeight = Math.max(...columnHeights, 0);
+    const minVisibleTop = Math.max(galleryScrollTop - overscan, 0);
+    const maxVisibleBottom = galleryScrollTop + galleryViewportHeight + overscan;
+    const visibleItems = items.filter(item => item.top + item.renderHeight >= minVisibleTop && item.top <= maxVisibleBottom);
+
+    return { visibleItems, totalHeight, usedWidth };
+  }, [galleryImages, galleryScrollTop, galleryViewportHeight, galleryViewportWidth]);
+
+  const galleryModal = showGallery ? (
+    <div className="fixed inset-0 z-[10000] flex items-center justify-center p-4">
+      <div
+        className="absolute inset-0 bg-black/60"
+        onClick={() => setShowGallery(false)}
+      />
+      <div className="relative w-full max-w-6xl max-h-[90vh] bg-white dark:bg-gray-900 rounded-2xl shadow-2xl overflow-hidden flex flex-col">
+        <div className="flex items-center justify-between p-4 border-b border-gray-100 dark:border-gray-800">
+          <div>
+            <h3 className="text-lg font-semibold text-gray-900 dark:text-gray-100">照片墙</h3>
+            {!galleryLoading && (
+              <p className="text-sm text-gray-500 dark:text-gray-400">
+                共 {galleryTotal} 张
+              </p>
+            )}
+          </div>
+          <button
+            onClick={() => setShowGallery(false)}
+            className="p-2 rounded-full hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors"
+            aria-label="关闭照片墙"
+          >
+            <X size={20} className="text-gray-500 dark:text-gray-400" />
+          </button>
+        </div>
+
+        <div ref={galleryScrollRef} className="flex-1 overflow-y-auto overflow-x-hidden p-4">
+          {galleryLoading && (
+            <div className="flex items-center justify-center py-20">
+              <div className="animate-spin rounded-full h-10 w-10 border-b-2 border-green-500"></div>
+            </div>
+          )}
+
+          {!galleryLoading && galleryError && (
+            <div className="text-center py-12 text-red-500 dark:text-red-400">{galleryError}</div>
+          )}
+
+          {!galleryLoading && !galleryError && galleryImages.length === 0 && (
+            <div className="text-center py-12 text-gray-500 dark:text-gray-400">暂无图片</div>
+          )}
+
+          {!galleryLoading && !galleryError && galleryImages.length > 0 && (
+            <div
+              className="relative mx-auto"
+              style={{ height: virtualGalleryLayout.totalHeight, width: virtualGalleryLayout.usedWidth || '100%' }}
+            >
+              {virtualGalleryLayout.visibleItems.map((image) => {
+                const imageUrl = processImageUrl(
+                  getTMDBImageUrl(image.file_path, image.imageType === 'poster' ? 'w500' : 'original')
+                );
+                const thumbUrl = processImageUrl(
+                  getTMDBImageUrl(image.file_path, image.imageType === 'poster' ? 'w342' : 'w780')
+                );
+
+                return (
+                  <div
+                    key={`${image.imageType}-${image.file_path}-${image.index}`}
+                    className="group absolute"
+                    style={{
+                      top: image.top,
+                      left: image.left,
+                      width: image.renderWidth,
+                      height: image.renderHeight,
+                    }}
+                  >
+                    <div
+                      className="relative w-full h-full overflow-hidden rounded-md bg-gray-100 dark:bg-gray-800 cursor-pointer hover:opacity-90 transition-opacity"
+                      onClick={() => handleImageClick(imageUrl)}
+                    >
+                      <Image
+                        src={thumbUrl}
+                        alt={`${detailData?.title || title}-gallery-${image.index + 1}`}
+                        fill
+                        sizes="(max-width: 640px) 50vw, (max-width: 1024px) 33vw, (max-width: 1280px) 25vw, 20vw"
+                        className="object-cover"
+                        draggable={false}
+                      />
+                      <div className="absolute left-2 top-2 px-2 py-0.5 rounded-full text-xs bg-black/60 text-white">
+                        {image.imageType === 'poster' ? '海报' : '剧照'}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  ) : null;
+
   if (!isVisible || !mounted) return null;
 
   const content = useDrawer ? (
@@ -938,7 +1185,7 @@ const DetailPanel: React.FC<DetailPanelProps> = ({
 
               {/* 数据源显示和切换 - 错误时也显示 */}
               <div className="mt-6 pt-4 border-t border-gray-200 dark:border-gray-700">
-                <div className="flex items-center justify-between">
+                <div className="flex items-center justify-between gap-3 flex-wrap">
                   <div className="flex items-center gap-2">
                     <span className="text-sm text-gray-500 dark:text-gray-400">数据来源:</span>
                     <span className="text-sm font-medium text-gray-700 dark:text-gray-300 uppercase">
@@ -948,24 +1195,27 @@ const DetailPanel: React.FC<DetailPanelProps> = ({
                       {currentSource === 'tmdb' && 'TMDB'}
                     </span>
                   </div>
-                  {currentSource !== 'tmdb' && (
-                    <button
-                      onClick={handleToggleSource}
-                      disabled={loading}
-                      className="px-3 py-1.5 text-sm rounded-lg bg-green-500 hover:bg-green-600 text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                    >
-                      切换到 TMDB
-                    </button>
-                  )}
-                  {currentSource === 'tmdb' && originalSource !== 'tmdb' && originalDetailData && (
-                    <button
-                      onClick={handleToggleSource}
-                      disabled={loading}
-                      className="px-3 py-1.5 text-sm rounded-lg bg-gray-500 hover:bg-gray-600 text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                    >
-                      切换回 {originalSource === 'douban' ? 'Douban' : originalSource === 'bangumi' ? 'Bangumi' : 'CMS'}
-                    </button>
-                  )}
+                  <div className="flex items-center gap-2 flex-wrap">
+                    {galleryEntryButton}
+                    {currentSource !== 'tmdb' && (
+                      <button
+                        onClick={handleToggleSource}
+                        disabled={loading}
+                        className="px-3 py-1.5 text-sm rounded-lg bg-green-500 hover:bg-green-600 text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        切换到 TMDB
+                      </button>
+                    )}
+                    {currentSource === 'tmdb' && originalSource !== 'tmdb' && originalDetailData && (
+                      <button
+                        onClick={handleToggleSource}
+                        disabled={loading}
+                        className="px-3 py-1.5 text-sm rounded-lg bg-gray-500 hover:bg-gray-600 text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        切换回 {originalSource === 'douban' ? 'Douban' : originalSource === 'bangumi' ? 'Bangumi' : 'CMS'}
+                      </button>
+                    )}
+                  </div>
                 </div>
               </div>
             </div>
@@ -976,11 +1226,14 @@ const DetailPanel: React.FC<DetailPanelProps> = ({
               {/* 海报和基本信息 */}
               <div className="flex gap-6 mb-6">
                 {detailData.poster && (
-                  <div
-                    className="relative w-32 h-48 rounded-lg overflow-hidden bg-gray-100 dark:bg-gray-800 flex-shrink-0 cursor-pointer hover:opacity-90 transition-opacity"
-                    onClick={() => handleImageClick(detailData.poster!)}
-                  >
-                    <Image src={detailData.poster} alt={detailData.title} fill className="object-cover" draggable={false} />
+                  <div className="flex flex-col items-start gap-3 flex-shrink-0">
+                    <div
+                      className="relative w-32 h-48 rounded-lg overflow-hidden bg-gray-100 dark:bg-gray-800 cursor-pointer hover:opacity-90 transition-opacity"
+                      onClick={() => handleImageClick(detailData.poster!)}
+                    >
+                      <Image src={detailData.poster} alt={detailData.title} fill className="object-cover" draggable={false} />
+                    </div>
+                    {galleryEntryButton}
                   </div>
                 )}
                 <div className="flex-1 min-w-0">
@@ -1332,7 +1585,7 @@ const DetailPanel: React.FC<DetailPanelProps> = ({
 
               {/* 数据源显示和切换 */}
               <div className="mt-6 pt-4 border-t border-gray-200 dark:border-gray-700">
-                <div className="flex items-center justify-between">
+                <div className="flex items-center justify-between gap-3 flex-wrap">
                   <div className="flex items-center gap-2">
                     <span className="text-sm text-gray-500 dark:text-gray-400">数据来源:</span>
                     <span className="text-sm font-medium text-gray-700 dark:text-gray-300 uppercase">
@@ -1342,24 +1595,27 @@ const DetailPanel: React.FC<DetailPanelProps> = ({
                       {currentSource === 'tmdb' && 'TMDB'}
                     </span>
                   </div>
-                  {currentSource !== 'tmdb' && (
-                    <button
-                      onClick={handleToggleSource}
-                      disabled={loading}
-                      className="px-3 py-1.5 text-sm rounded-lg bg-green-500 hover:bg-green-600 text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                    >
-                      切换到 TMDB
-                    </button>
-                  )}
-                  {currentSource === 'tmdb' && originalSource !== 'tmdb' && originalDetailData && (
-                    <button
-                      onClick={handleToggleSource}
-                      disabled={loading}
-                      className="px-3 py-1.5 text-sm rounded-lg bg-gray-500 hover:bg-gray-600 text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                    >
-                      切换回 {originalSource === 'douban' ? 'Douban' : originalSource === 'bangumi' ? 'Bangumi' : 'CMS'}
-                    </button>
-                  )}
+                  <div className="flex items-center gap-2 flex-wrap">
+                    {galleryEntryButton}
+                    {currentSource !== 'tmdb' && (
+                      <button
+                        onClick={handleToggleSource}
+                        disabled={loading}
+                        className="px-3 py-1.5 text-sm rounded-lg bg-green-500 hover:bg-green-600 text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        切换到 TMDB
+                      </button>
+                    )}
+                    {currentSource === 'tmdb' && originalSource !== 'tmdb' && originalDetailData && (
+                      <button
+                        onClick={handleToggleSource}
+                        disabled={loading}
+                        className="px-3 py-1.5 text-sm rounded-lg bg-gray-500 hover:bg-gray-600 text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        切换回 {originalSource === 'douban' ? 'Douban' : originalSource === 'bangumi' ? 'Bangumi' : 'CMS'}
+                      </button>
+                    )}
+                  </div>
                 </div>
               </div>
             </div>
@@ -1368,6 +1624,7 @@ const DetailPanel: React.FC<DetailPanelProps> = ({
       </div>
 
       {/* 图片查看器 */}
+      {galleryModal}
       {showImageViewer && (
         <ImageViewer
           isOpen={showImageViewer}
@@ -1480,11 +1737,14 @@ const DetailPanel: React.FC<DetailPanelProps> = ({
               {/* 海报和基本信息 */}
               <div className="flex gap-6 mb-6">
                 {detailData.poster && (
-                  <div
-                    className="relative w-32 h-48 rounded-lg overflow-hidden bg-gray-100 dark:bg-gray-800 flex-shrink-0 cursor-pointer hover:opacity-90 transition-opacity"
-                    onClick={() => handleImageClick(detailData.poster!)}
-                  >
-                    <Image src={detailData.poster} alt={detailData.title} fill className="object-cover" draggable={false} />
+                  <div className="flex flex-col items-start gap-3 flex-shrink-0">
+                    <div
+                      className="relative w-32 h-48 rounded-lg overflow-hidden bg-gray-100 dark:bg-gray-800 cursor-pointer hover:opacity-90 transition-opacity"
+                      onClick={() => handleImageClick(detailData.poster!)}
+                    >
+                      <Image src={detailData.poster} alt={detailData.title} fill className="object-cover" draggable={false} />
+                    </div>
+                    {galleryEntryButton}
                   </div>
                 )}
                 <div className="flex-1 min-w-0">
@@ -1872,6 +2132,7 @@ const DetailPanel: React.FC<DetailPanelProps> = ({
       </div>
 
       {/* 图片查看器 */}
+      {galleryModal}
       {showImageViewer && (
         <ImageViewer
           isOpen={showImageViewer}
